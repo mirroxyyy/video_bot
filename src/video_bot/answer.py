@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -58,10 +58,18 @@ class DateFilter(BaseModel):
     def validate_range(self):
         if self.from_ > self.to:
             raise ValueError("date_filter.from must be <= date_filter.to")
+        self.from_ = self.from_.replace(tzinfo=UTC)
+        self.to = self.to.replace(tzinfo=UTC)
         return self
 
 
 FilterNode = Condition | ConditionGroup
+
+
+class Join(BaseModel):
+    source_field: str
+    target_field: str
+    target_entity: Entity
 
 
 VIDEO_FIELDS = {
@@ -96,12 +104,15 @@ class Answer(BaseModel):
     distinct: bool
     where: FilterNode | None = None
     date_filter: DateFilter | None = None
+    join: Join | None = None
 
     @model_validator(mode="after")
     def validate_plan(self):
         allowed_fields = (
             VIDEO_FIELDS if self.entity == Entity.video else SNAPSHOT_FIELDS
         )
+        if self.join:
+            allowed_fields = VIDEO_FIELDS | SNAPSHOT_FIELDS
 
         if self.field not in allowed_fields:
             raise ValueError(
@@ -111,7 +122,7 @@ class Answer(BaseModel):
         if self.field.startswith("delta_") and self.entity != Entity.video_snapshots:
             raise ValueError("delta_* fields allowed only for video_snapshots")
 
-        if self.operation == Operation.count and self.field.startswith("delta_"):
+        if self.operation == Operation.count_ and self.field.startswith("delta_"):
             if not (self.distinct and self.field == "video_id"):
                 raise ValueError(
                     "count with delta_* allowed only for DISTINCT video_id"

@@ -1,4 +1,3 @@
-from datetime import datetime, timedelta
 from logging import getLogger
 
 from aiogram import Router
@@ -70,7 +69,16 @@ SYSTEM_PROMPT = """
 3) Если спрашивают: "за день", "в этот день", "28 ноября 2025", ТО фильтрация делается по одному календарному дню.
 4) Если спрашивают: "с X по Y включительно", ТО это диапазон дат [X, Y].
 5) "Сколько разных видео" = count DISTINCT video_id.
-6) Всегда возвращается ОДНО число.
+6) Если спрашивают для конкретного креатора или video_id, то необходим фильтр по этому полю в WHERE.
+7) Всегда возвращается ОДНО число.
+8) Для фильтрации полей, которых нет в основной таблице запроса (например creator_id на video_snapshots), используй join с таблицей videos через video_id → videos.id. В JSON добавляй объект join:
+
+{
+  "source_field": "video_id",
+  "target_entity": "video",
+  "target_field": "id"
+}
+После этого можешь использовать колонки из другой таблицы
 
 ФОРМАТ JSON (СТРОГО)
 
@@ -85,6 +93,11 @@ JSON ВСЕГДА имеет следующую структуру:
   "date_filter": {
     "from": "YYYY-MM-DDTHH:MM:SS",
     "to": "YYYY-MM-DDTHH:MM:SS"
+  } | null,
+  "join": {
+      "source_field": string,
+      "target_entity": "video" | "video_snapshots",
+      "target_field": string
   } | null
 }
 
@@ -117,10 +130,10 @@ FILTER TREE
 - COUNT + delta_* запрещён, КРОМЕ случаев count DISTINCT video_id.
 - Если фильтров нет — where = null.
 - Если даты нет — date_filter = null.
+- Если фильтр требует поля из другой таблицы, используй join как указано выше.
 
 Если запрос некорректный или неоднозначный,
 верни максимально безопасный вариант без выдумывания.
-
 
 ПРИМЕРЫ:
 
@@ -134,7 +147,8 @@ FILTER TREE
   "field": "id",
   "distinct": true,
   "where": null,
-  "date_filter": null
+  "date_filter": null,
+  "join": null
 }
 
 Вопрос:
@@ -161,7 +175,8 @@ FILTER TREE
   "date_filter": {
     "from": "2025-11-01T00:00:00",
     "to": "2025-11-05T23:59:59"
-  }
+  },
+  "join": null
 }
 
 Вопрос:
@@ -177,33 +192,28 @@ FILTER TREE
   "date_filter": {
     "from": "2025-11-28T00:00:00",
     "to": "2025-11-28T23:59:59"
-  }
+  },
+  "join": null
 }
 
 Вопрос:
-Сколько разных видео получали новые просмотры 27 ноября 2025?
+На сколько просмотров выросли все видео креатора с id 42 28 ноября 2025?
 
 Ответ:
 {
   "entity": "video_snapshots",
-  "operation": "count",
-  "field": "video_id",
-  "distinct": true,
-  "where": {
-    "type": "group",
-    "op": "and",
-    "conditions": [
-      {
-        "type": "condition",
-        "field": "delta_views_count",
-        "operator": ">",
-        "value": 0
-      }
-    ]
-  },
+  "operation": "sum",
+  "field": "delta_views_count",
+  "distinct": false,
+  "where": null,
   "date_filter": {
-    "from": "2025-11-27T00:00:00",
-    "to": "2025-11-27T23:59:59"
+    "from": "2025-11-28T00:00:00",
+    "to": "2025-11-28T23:59:59"
+  },
+  "join": {
+      "source_field": "video_id",
+      "target_entity": "video",
+      "target_field": "id"
   }
 }
 
@@ -230,9 +240,11 @@ async def make_request(req: str) -> str | None:
     return response.choices[0].message.content
 
 
-def build_filter(node: FilterNode, entity_cls) -> ClauseElement:
+def build_filter(node: FilterNode, entity_cls, join_cls) -> ClauseElement:
     if isinstance(node, Condition):
-        field = getattr(entity_cls, node.field)
+        field = getattr(entity_cls, node.field, None)
+        if not field:
+            field = getattr(join_cls, node.field)
         op = node.operator
 
         if op == "=":
@@ -250,7 +262,7 @@ def build_filter(node: FilterNode, entity_cls) -> ClauseElement:
         else:
             raise ValueError(f"Unsupported operator {op}")
     elif isinstance(node, ConditionGroup):
-        children = [build_filter(c, entity_cls) for c in node.conditions]
+        children = [build_filter(c, entity_cls, join_cls) for c in node.conditions]
         if node.op == LogicalOp.and_:
             return and_(*children)  # type: ignore
         elif node.op == LogicalOp.or_:
@@ -263,14 +275,17 @@ def build_filter(node: FilterNode, entity_cls) -> ClauseElement:
 
 def build_query(plan: Answer):
     entity_cls = VideoOrm if plan.entity == Entity.video else VideoSnapshotOrm
-
+    join_cls = (
+        (VideoOrm if plan.join.target_entity == Entity.video else VideoSnapshotOrm)
+        if plan.join
+        else None
+    )
     field = getattr(entity_cls, plan.field)
 
     if plan.operation == Operation.count_:
-        if plan.distinct:
-            stmt = select(func.count(func.distinct(field)))
-        else:
-            stmt = select(func.count(field))
+        stmt = select(
+            func.count(func.distinct(field)) if plan.distinct else func.count(field)
+        )
     elif plan.operation == Operation.sum:
         stmt = select(func.coalesce(func.sum(field), 0))
     else:
@@ -278,12 +293,11 @@ def build_query(plan: Answer):
 
     filters = []
     if plan.where:
-        filters.append(build_filter(plan.where, entity_cls))
+        filters.append(build_filter(plan.where, entity_cls, join_cls))
 
     if plan.date_filter:
-        from_date: datetime = plan.date_filter.from_
-        to_date: datetime = plan.date_filter.to
-
+        from_date = plan.date_filter.from_
+        to_date = plan.date_filter.to
         date_field = (
             entity_cls.created_at
             if plan.entity == Entity.video_snapshots
@@ -292,8 +306,16 @@ def build_query(plan: Answer):
         filters.append(date_field >= from_date)
         filters.append(date_field <= to_date)
 
-    if filters:
-        stmt = stmt.where(and_(*filters))
+    stmt = stmt.where(and_(*filters)) if filters else stmt
+
+    if join_cls and plan.join:
+        stmt = stmt.select_from(
+            entity_cls.__table__.join(
+                join_cls.__table__,
+                getattr(entity_cls, plan.join.source_field)
+                == getattr(join_cls, plan.join.target_field),
+            )
+        )
 
     return stmt
 
